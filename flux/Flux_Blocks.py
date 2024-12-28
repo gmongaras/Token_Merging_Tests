@@ -21,9 +21,60 @@ from diffusers.utils.import_utils import is_torch_npu_available
 from diffusers.utils.torch_utils import maybe_allow_in_graph
 from diffusers.models.embeddings import CombinedTimestepGuidanceTextProjEmbeddings, CombinedTimestepTextProjEmbeddings
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
+from typing import List
+
+from diffusers import FluxPipeline
 
 
 from Merge import BipartiteSoftMatching, calculate_indices
+
+
+
+
+
+
+
+
+
+
+
+
+# YiYi to-do: refactor rope related functions/classes
+def rope(pos: torch.Tensor, dim: int, theta: int) -> torch.Tensor:
+    assert dim % 2 == 0, "The dimension must be even."
+
+    scale = torch.arange(0, dim, 2, dtype=torch.float64, device=pos.device) / dim
+    omega = 1.0 / (theta**scale)
+
+    batch_size, seq_length = pos.shape
+    out = torch.einsum("...n,d->...nd", pos, omega)
+    cos_out = torch.cos(out)
+    sin_out = torch.sin(out)
+
+    stacked_out = torch.stack([cos_out, -sin_out, sin_out, cos_out], dim=-1)
+    out = stacked_out.view(batch_size, -1, dim // 2, 2, 2)
+    return out.float()
+
+
+# YiYi to-do: refactor rope related functions/classes
+class EmbedND(nn.Module):
+    def __init__(self, dim: int, theta: int, axes_dim: List[int]):
+        super().__init__()
+        self.dim = dim
+        self.theta = theta
+        self.axes_dim = axes_dim
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        n_axes = ids.shape[-1]
+        emb = torch.cat(
+            [rope(ids[..., i], self.axes_dim[i], self.theta) for i in range(n_axes)],
+            dim=-3,
+        )
+        return emb.unsqueeze(1)
+    
+
+
+pos_embed = EmbedND(dim=128*24, theta=10000, axes_dim=[16, 56, 56])
 
 
 
@@ -116,6 +167,8 @@ class FluxTransformerBlock(nn.Module):
 
         self.merge_method = "Random"
 
+        self.reencode_pos_enc = False
+
     def forward(
         self,
         hidden_states: torch.FloatTensor,
@@ -167,44 +220,67 @@ class FluxTransformerBlock(nn.Module):
             # image_rotary_emb = torch.cat((image_rotary_emb[:, :, :text_size], image_rotary_emb[:, :, text_size+self.hidden_states_merge.unm_idx[0, :, 0]], ((image_rotary_emb[:, :, text_size+self.hidden_states_merge.dst_idx[0, :, 0]] + image_rotary_emb[:, :, text_size+self.hidden_states_merge.src_idx[0, :, 0]])/2)), dim=2)
 
 
-            # Slice the rotary embeddings
-            # The first part of the rotary embeddings is the text part and the last part is the second part
-            # image_rotary_emb = torch.cat((image_rotary_emb[:, :, self.hidden_states_merge.unm_idx[0, :, 0]], ((image_rotary_emb[:, :, self.hidden_states_merge.dst_idx[0, :, 0]] + image_rotary_emb[:, :, self.hidden_states_merge.src_idx[0, :, 0]])/2), image_rotary_emb[:, :, -norm_encoder_hidden_states.shape[1]:]), dim=2)
-            if self.merge_method == "Random":
-                # if not hasattr(self, "image_rotary_emb"):
-                self.image_rotary_emb = torch.cat(
-                    (
-                        image_rotary_emb[:, :, :text_size], 
-                        image_rotary_emb[:, :, text_size+self.hidden_states_merge.unm_idx[0, :, 0]], 
-                        ((image_rotary_emb[:, :, text_size+self.hidden_states_merge.dst_idx[0, :, 0]] + image_rotary_emb[:, :, text_size+self.hidden_states_merge.src_idx[0, :, 0]])/2)
-                    ), dim=2)
+
+
+            # Reencode the positional embeddings
+            if hasattr(self, "image_rotary_emb"):
                 image_rotary_emb = self.image_rotary_emb
-                    
-            elif self.merge_method == "BipartiteSoftMatching":
-                image_rotary_emb_txt = image_rotary_emb[:, :, :text_size]
-                image_rotary_emb = image_rotary_emb[:, :, text_size:]
-
-                def split(x):
-                    B, N = x.shape[0], x.shape[2]
-                    C1, C2, C3 = x.shape[3], x.shape[4], x.shape[5]
-                    src = x[:, :, self.hidden_states_merge.a_idx.squeeze()]
-                    dst = x[:, :, self.hidden_states_merge.b_idx.squeeze()]
-                    return src, dst
-                src, dst = split(image_rotary_emb)
-                
-                unm = src[:, :, self.hidden_states_merge.unm_idx.squeeze()]
-                src = src[:, :, self.hidden_states_merge.src_idx.squeeze()]
-                C1, C2, C3 = src.shape[3], src.shape[4], src.shape[5]
-                dst = dst.scatter_reduce(2, self.hidden_states_merge.dst_idx[:, None, :, :, None, None].expand(1, 1, self.hidden_states_merge.r, C1, C2, C3), src, reduce="mean")
-
-                image_rotary_emb = torch.cat(
-                    (
-                        image_rotary_emb_txt, 
-                        unm,
-                        dst,
-                    ), dim=2)
             else:
-                raise ValueError("Invalid merge method")
+                if self.reencode_pos_enc:
+                    latent_image_ids = FluxPipeline._prepare_latent_image_ids(1, 1024//8, 1024//8, "cuda", torch.bfloat16)
+                    text_ids = torch.zeros(1, 512, 3).to(device=torch.device("cuda"), dtype=torch.bfloat16)
+                    text_ids = text_ids.repeat(1, 1, 1)
+                    # image_rotary_emb = pos_embed(torch.cat([text_ids, latent_image_ids], dim=1))
+                    image_rotary_emb = pos_embed(torch.cat([
+                        text_ids, 
+                        latent_image_ids.gather(1, self.hidden_states_merge.unm_idx.repeat(1, 1, 3)),
+                        (
+                            (latent_image_ids.gather(1, self.hidden_states_merge.src_idx.repeat(1, 1, 3)) + latent_image_ids.gather(1, self.hidden_states_merge.dst_idx.repeat(1, 1, 3))) / 2
+                        )
+                        ], dim=1
+                    ))
+                    self.image_rotary_emb = image_rotary_emb
+                else:
+                    # Slice the rotary embeddings
+                    # The first part of the rotary embeddings is the text part and the last part is the second part
+                    # image_rotary_emb = torch.cat((image_rotary_emb[:, :, self.hidden_states_merge.unm_idx[0, :, 0]], ((image_rotary_emb[:, :, self.hidden_states_merge.dst_idx[0, :, 0]] + image_rotary_emb[:, :, self.hidden_states_merge.src_idx[0, :, 0]])/2), image_rotary_emb[:, :, -norm_encoder_hidden_states.shape[1]:]), dim=2)
+                    if self.merge_method == "Random":
+                        # if not hasattr(self, "image_rotary_emb"):
+                        self.image_rotary_emb = torch.cat(
+                            (
+                                image_rotary_emb[:, :, :text_size], 
+                                image_rotary_emb[:, :, text_size+self.hidden_states_merge.unm_idx[0, :, 0]], 
+                                ((image_rotary_emb[:, :, text_size+self.hidden_states_merge.dst_idx[0, :, 0]] + image_rotary_emb[:, :, text_size+self.hidden_states_merge.src_idx[0, :, 0]])/2)
+                            ), dim=2)
+                        image_rotary_emb = self.image_rotary_emb
+                            
+                    elif self.merge_method == "BipartiteSoftMatching":
+                        image_rotary_emb_txt = image_rotary_emb[:, :, :text_size]
+                        image_rotary_emb = image_rotary_emb[:, :, text_size:]
+
+                        def split(x):
+                            B, N = x.shape[0], x.shape[2]
+                            C1, C2, C3 = x.shape[3], x.shape[4], x.shape[5]
+                            src = x[:, :, self.hidden_states_merge.a_idx.squeeze()]
+                            dst = x[:, :, self.hidden_states_merge.b_idx.squeeze()]
+                            return src, dst
+                        src, dst = split(image_rotary_emb)
+                        
+                        unm = src[:, :, self.hidden_states_merge.unm_idx.squeeze()]
+                        src = src[:, :, self.hidden_states_merge.src_idx.squeeze()]
+                        C1, C2, C3 = src.shape[3], src.shape[4], src.shape[5]
+                        dst = dst.scatter_reduce(2, self.hidden_states_merge.dst_idx[:, None, :, :, None, None].expand(1, 1, self.hidden_states_merge.r, C1, C2, C3), src, reduce="mean")
+
+                        image_rotary_emb = torch.cat(
+                            (
+                                image_rotary_emb_txt, 
+                                unm,
+                                dst,
+                            ), dim=2)
+                        
+                        self.image_rotary_emb = image_rotary_emb
+                    else:
+                        raise ValueError("Invalid merge method")
 
 
 
@@ -360,6 +436,8 @@ class FluxSingleTransformerBlock(nn.Module):
 
         self.merge_method = "Random"
 
+        self.reencode_pos_enc = False
+
     def forward(
         self,
         hidden_states: torch.FloatTensor,
@@ -406,44 +484,64 @@ class FluxSingleTransformerBlock(nn.Module):
                 ), dim=1
             )
 
-            # Slice the rotary embeddings
-            # The first part of the rotary embeddings is the text part and the last part is the second part
-            # image_rotary_emb = torch.cat((image_rotary_emb[:, :, self.hidden_states_merge.unm_idx[0, :, 0]], ((image_rotary_emb[:, :, self.hidden_states_merge.dst_idx[0, :, 0]] + image_rotary_emb[:, :, self.hidden_states_merge.src_idx[0, :, 0]])/2), image_rotary_emb[:, :, -norm_encoder_hidden_states.shape[1]:]), dim=2)
-            if self.merge_method == "Random":
-                # if not hasattr(self, "image_rotary_emb"):
-                self.image_rotary_emb = torch.cat(
-                    (
-                        image_rotary_emb[:, :, :text_size], 
-                        image_rotary_emb[:, :, text_size+self.hidden_states_merge.unm_idx[0, :, 0]], 
-                        ((image_rotary_emb[:, :, text_size+self.hidden_states_merge.dst_idx[0, :, 0]] + image_rotary_emb[:, :, text_size+self.hidden_states_merge.src_idx[0, :, 0]])/2)
-                    ), dim=2)
+
+            # Reencode the positional embeddings
+            if hasattr(self, "image_rotary_emb"):
                 image_rotary_emb = self.image_rotary_emb
-                    
-            elif self.merge_method == "BipartiteSoftMatching":
-                image_rotary_emb_txt = image_rotary_emb[:, :, :text_size]
-                image_rotary_emb = image_rotary_emb[:, :, text_size:]
-
-                def split(x):
-                    B, N = x.shape[0], x.shape[2]
-                    C1, C2, C3 = x.shape[3], x.shape[4], x.shape[5]
-                    src = x[:, :, self.hidden_states_merge.a_idx.squeeze()]
-                    dst = x[:, :, self.hidden_states_merge.b_idx.squeeze()]
-                    return src, dst
-                src, dst = split(image_rotary_emb)
-                
-                unm = src[:, :, self.hidden_states_merge.unm_idx.squeeze()]
-                src = src[:, :, self.hidden_states_merge.src_idx.squeeze()]
-                C1, C2, C3 = src.shape[3], src.shape[4], src.shape[5]
-                dst = dst.scatter_reduce(2, self.hidden_states_merge.dst_idx[:, None, :, :, None, None].expand(1, 1, self.hidden_states_merge.r, C1, C2, C3), src, reduce="mean")
-
-                image_rotary_emb = torch.cat(
-                    (
-                        image_rotary_emb_txt, 
-                        unm,
-                        dst,
-                    ), dim=2)
             else:
-                raise ValueError("Invalid merge method")
+                if self.reencode_pos_enc:
+                    latent_image_ids = FluxPipeline._prepare_latent_image_ids(1, 1024//8, 1024//8, "cuda", torch.bfloat16)
+                    text_ids = torch.zeros(1, 512, 3).to(device=torch.device("cuda"), dtype=torch.bfloat16)
+                    text_ids = text_ids.repeat(1, 1, 1)
+                    image_rotary_emb = pos_embed(torch.cat([
+                        text_ids, 
+                        latent_image_ids.gather(1, self.hidden_states_merge.unm_idx.repeat(1, 1, 3)),
+                        (
+                            (latent_image_ids.gather(1, self.hidden_states_merge.src_idx.repeat(1, 1, 3)) + latent_image_ids.gather(1, self.hidden_states_merge.dst_idx.repeat(1, 1, 3))) / 2
+                        )
+                        ], dim=1
+                    ))
+                    self.image_rotary_emb = image_rotary_emb
+                else:
+                    # Slice the rotary embeddings
+                    # The first part of the rotary embeddings is the text part and the last part is the second part
+                    # image_rotary_emb = torch.cat((image_rotary_emb[:, :, self.hidden_states_merge.unm_idx[0, :, 0]], ((image_rotary_emb[:, :, self.hidden_states_merge.dst_idx[0, :, 0]] + image_rotary_emb[:, :, self.hidden_states_merge.src_idx[0, :, 0]])/2), image_rotary_emb[:, :, -norm_encoder_hidden_states.shape[1]:]), dim=2)
+                    if self.merge_method == "Random":
+                        # if not hasattr(self, "image_rotary_emb"):
+                        self.image_rotary_emb = torch.cat(
+                            (
+                                image_rotary_emb[:, :, :text_size], 
+                                image_rotary_emb[:, :, text_size+self.hidden_states_merge.unm_idx[0, :, 0]], 
+                                ((image_rotary_emb[:, :, text_size+self.hidden_states_merge.dst_idx[0, :, 0]] + image_rotary_emb[:, :, text_size+self.hidden_states_merge.src_idx[0, :, 0]])/2)
+                            ), dim=2)
+                        image_rotary_emb = self.image_rotary_emb
+                            
+                    elif self.merge_method == "BipartiteSoftMatching":
+                        image_rotary_emb_txt = image_rotary_emb[:, :, :text_size]
+                        image_rotary_emb = image_rotary_emb[:, :, text_size:]
+
+                        def split(x):
+                            B, N = x.shape[0], x.shape[2]
+                            C1, C2, C3 = x.shape[3], x.shape[4], x.shape[5]
+                            src = x[:, :, self.hidden_states_merge.a_idx.squeeze()]
+                            dst = x[:, :, self.hidden_states_merge.b_idx.squeeze()]
+                            return src, dst
+                        src, dst = split(image_rotary_emb)
+                        
+                        unm = src[:, :, self.hidden_states_merge.unm_idx.squeeze()]
+                        src = src[:, :, self.hidden_states_merge.src_idx.squeeze()]
+                        C1, C2, C3 = src.shape[3], src.shape[4], src.shape[5]
+                        dst = dst.scatter_reduce(2, self.hidden_states_merge.dst_idx[:, None, :, :, None, None].expand(1, 1, self.hidden_states_merge.r, C1, C2, C3), src, reduce="mean")
+
+                        image_rotary_emb = torch.cat(
+                            (
+                                image_rotary_emb_txt, 
+                                unm,
+                                dst,
+                            ), dim=2)
+                        self.image_rotary_emb = image_rotary_emb
+                    else:
+                        raise ValueError("Invalid merge method")
                     
 
 
